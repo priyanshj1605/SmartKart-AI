@@ -3,7 +3,6 @@ from zoneinfo import ZoneInfo
 
 import holidays
 
-
 INDIAN_REGIONS = set(holidays.IN.subdivisions)
 UPCOMING_FESTIVAL_WINDOW_DAYS = 90
 INDIAN_REGION_NAMES = {

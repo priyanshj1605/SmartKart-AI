@@ -119,25 +119,7 @@ The exact package versions and available scripts are defined in the repository's
 
 SmartKart AI follows a frontend-backend architecture.
 
-User
- |
- v
-React + Vite Frontend
- |
- | HTTP API requests
- v
-FastAPI Backend
- |
- +---- SQLite Database
- |       |
- |       +---- Products and inventory batches
- |       +---- Customers and invoices
- |       +---- Sales and inventory adjustments
- |
- +---- Festival Calendar
- |
- +---- Optional OpenRouter API
-         AI-generated summaries
+User -> React + Vite Frontend (HTTP API requests) -> FastAPI Backend [SQLite Database (Products and inventory batches, Customers and invoices, Sales and inventory adjustments)] -> Festival Calendar -> Optional OpenRouter API (AI-generated summaries)
 
 The frontend handles the user interface and sends requests to the backend. The backend handles application logic, database operations, inventory calculations, and optional AI integration.
 
@@ -147,36 +129,15 @@ OpenRouter credentials must remain on the backend and must never be exposed in b
 
 The repository may contain additional files as the project evolves. The following illustrates the main structure:
 
-SmartKart-AI/
-├── backend/
-│   ├── main.py
-│   ├── database.py
-│   ├── security.py
-│   ├── ai_service.py
-│   └── tests/
-├── public/
-├── src/
-│   ├── assets/
-│   ├── components/
-│   ├── hooks/
-│   ├── layouts/
-│   ├── lib/
-│   ├── pages/
-│   ├── routes/
-│   ├── services/
-│   ├── store/
-│   ├── types/
-│   ├── utils/
-│   ├── App.jsx
-│   ├── App.css
-│   ├── index.css
-│   └── main.jsx
-├── .env.example
-├── .gitignore
-├── index.html
-├── package.json
-├── requirements.txt
-└── README.md
+SmartKart-AI :- 
+1. backend (main.py, database.py, security.py, ai_service.py, feature_flags.py, festivals.py, inventory.py)
+2. public
+3. src (assets/, components/, hooks/, layouts/, lib/, pages/, routes/, services/, store/, types/, utils/, App.jsx, App.css, index.css, main.jsx)
+4. .gitignore
+5. index.html
+6. package.json
+7. requirements.txt
+8. README.md
 
 **Note:** This is an illustrative structure based on the application's components. Check the actual repository before assuming every listed file exists.
 
