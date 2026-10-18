@@ -102,16 +102,15 @@ The system helps store owners:
 
 ## Technology Stack
 
-Component and Technology :-
-Frontend :- React
-Frontend tooling :- Vite Tailwind
-Frontend language :- JavaScript / JSX 
-Backend :- Python
-Backend framework :- FastAPI 
-Database :- SQLite
-AI integration :- OpenRouter API (optional)
-Festival calendar :- Python `holidays` package
-API server :- Uvicorn
+1. Frontend :- React
+2. Frontend tooling :- Vite Tailwind
+3. Frontend language :- JavaScript / JSX 
+4. Backend :- Python
+5. Backend framework :- FastAPI 
+6. Database :- SQLite
+7. AI integration :- OpenRouter API (optional)
+8. Festival calendar :- Python `holidays` package
+9. API server :- Uvicorn
 
 The exact package versions and available scripts are defined in the repository's dependency and configuration files.
 
