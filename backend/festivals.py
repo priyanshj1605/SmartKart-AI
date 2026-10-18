@@ -84,14 +84,12 @@ _CATEGORY_LABELS = {
     'electronics_accessories': 'Electronics & Accessories',
 }
 
-
 def normalize_category(category: str | None) -> str:
     normalized = ' '.join(''.join(
         character if character.isalnum() else ' '
         for character in (category or '').casefold()
     ).split())
     return _CATEGORY_ALIASES.get(normalized, normalized.replace(' ', '_'))
-
 
 FESTIVAL_CATEGORY_MAP = {
     'diwali': frozenset({
