@@ -1,16 +1,29 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from threading import Lock
 import hashlib
+import json
 import math
 import os
+import re
 import secrets
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from backend.ai_service import get_ai_suggestion
 from backend.database import get_connection
+from backend.feature_flags import require_enabled
+from backend.festivals import (
+    INDIAN_REGIONS,
+    filter_upcoming_festivals,
+    festival_category_labels,
+    india_today,
+    product_matches_festival_category,
+    upcoming_festivals,
+)
+from backend.inventory import InsufficientStockError, allocate_fefo_batches
 from backend.security import create_token, decode_token, hash_password, verify_password
 
 app = FastAPI(title='SmartKart AI API', version='2.0.0')
@@ -62,6 +75,12 @@ class BatchRequest(BaseModel):
     batch_number: Optional[str] = None
 
 
+class DiscardBatchRequest(BaseModel):
+    expected_quantity: int = Field(gt=0)
+    reason: Literal['Expired', 'Damaged', 'Other']
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
 class CustomerRequest(BaseModel):
     name: str = Field(min_length=1)
     mobile: Optional[str] = None
@@ -110,6 +129,7 @@ class ChangePasswordRequest(BaseModel):
 class PreferencesRequest(BaseModel):
     auto_reorder_alerts: bool
     ai_suggestions: bool
+    region: Optional[str] = Field(default=None, max_length=2)
 
 
 def current_user(authorization: Optional[str] = Header(default=None)):
@@ -139,14 +159,35 @@ def _product_row(connection, user_id, product_id):
 
 
 def _product_json(connection, user_id, row):
-    batches = connection.execute('SELECT * FROM product_batches WHERE product_id = ? AND user_id = ? ORDER BY expiry_date IS NULL, expiry_date, id', (row['id'], user_id)).fetchall()
+    batches = connection.execute('''SELECT b.* FROM product_batches b
+        WHERE b.product_id = ? AND b.user_id = ?
+            AND NOT EXISTS (
+                SELECT 1 FROM inventory_adjustments adjustment
+                WHERE adjustment.batch_id = b.id
+                    AND adjustment.product_id = b.product_id
+                    AND adjustment.user_id = b.user_id
+            )
+        ORDER BY b.expiry_date IS NULL, b.expiry_date, b.id''', (row['id'], user_id)).fetchall()
     today = now_local().date()
     available_batches = [batch for batch in batches if not batch['expiry_date'] or datetime.fromisoformat(batch['expiry_date']).date() > today]
     stock = sum(batch['quantity_remaining'] for batch in available_batches)
+    sell_first_id = next((batch['id'] for batch in available_batches if batch['quantity_remaining'] > 0), None)
     serialized_batches = []
     for batch in batches:
         expired = bool(batch['expiry_date'] and datetime.fromisoformat(batch['expiry_date']).date() <= today)
-        serialized_batches.append({**dict(batch), 'status': 'Expired' if expired else ('Out of Stock' if batch['quantity_remaining'] == 0 else 'Healthy')})
+        expiring_soon = bool(
+            batch['expiry_date']
+            and today < datetime.fromisoformat(batch['expiry_date']).date() <= today + timedelta(days=30)
+        )
+        serialized_batches.append({
+            **dict(batch),
+            'status': 'Expired' if expired else (
+                'Out of Stock' if batch['quantity_remaining'] == 0 else (
+                    'Expiring Soon' if expiring_soon else 'Healthy'
+                )
+            ),
+            'sell_first': batch['id'] == sell_first_id,
+        })
     return {
         'id': row['id'], 'name': row['name'], 'category': row['category'], 'sku': row['sku'], 'barcode': row['barcode'],
         'low_stock_threshold': row['low_stock_threshold'], 'stock': stock,
@@ -160,6 +201,11 @@ def _auto_reorder_enabled(connection, user_id):
     return bool(row['auto_reorder_alerts']) if row else True
 
 
+def _ai_suggestions_enabled(connection, user_id):
+    row = connection.execute('SELECT ai_suggestions FROM user_preferences WHERE user_id = ?', (user_id,)).fetchone()
+    return bool(row['ai_suggestions']) if row else True
+
+
 def _suggest_reorder_quantity(connection, user_id, product_id, current_stock, low_stock_threshold):
     sales = connection.execute('SELECT COALESCE(SUM(quantity), 0) quantity FROM sales WHERE user_id = ? AND product_id = ? AND sold_at >= datetime("now", "-30 days")', (user_id, product_id)).fetchone()['quantity']
     avg_daily_sales = sales / 30
@@ -170,32 +216,44 @@ def _suggest_reorder_quantity(connection, user_id, product_id, current_stock, lo
 
 def _notify_inventory_unlocked(connection, user_id):
     reorder_enabled = _auto_reorder_enabled(connection, user_id)
-    rows = connection.execute('''SELECT p.id product_id, p.name, p.category, p.low_stock_threshold, b.id batch_id, b.batch_number, b.quantity_remaining, b.expiry_date, b.supplier, b.purchase_price
-        FROM products p JOIN product_batches b ON b.product_id = p.id WHERE p.user_id = ? AND b.user_id = ? AND b.quantity_remaining > 0''', (user_id, user_id)).fetchall()
     today = now_local().date()
-    seen_reorder = set()
-    for row in rows:
-        product_stock = connection.execute('SELECT COALESCE(SUM(quantity_remaining), 0) stock FROM product_batches WHERE user_id = ? AND product_id = ?', (user_id, row['product_id'])).fetchone()['stock']
-        if reorder_enabled and product_stock <= row['low_stock_threshold'] and row['product_id'] not in seen_reorder:
-            seen_reorder.add(row['product_id'])
-            message = f"{row['name']} is below the reorder threshold. Stock: {product_stock} / Suggested reorder: {_suggest_reorder_quantity(connection, user_id, row['product_id'], product_stock, row['low_stock_threshold'])} units."
-            connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'reorder', message, row['product_id'], f"reorder-{row['product_id']}"))
-            connection.execute('UPDATE notifications SET message = ?, is_read = 0 WHERE user_id = ? AND fingerprint = ?', (message, user_id, f"reorder-{row['product_id']}"))
-        if row['expiry_date']:
-            try:
-                days = (datetime.fromisoformat(row['expiry_date']).date() - today).days
-            except ValueError:
-                days = None
-            if days is not None and 0 < days <= 30:
-                fingerprint = f"expiry-{row['batch_id']}-{row['expiry_date']}"
-                message = f"{row['name']} batch {row['batch_number']} will expire in {days} days."
-                connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'expiry', message, row['batch_id'], fingerprint))
-                connection.execute('UPDATE notifications SET message = ? WHERE user_id = ? AND fingerprint = ?', (message, user_id, fingerprint))
-            elif days is not None and days <= 0:
-                fingerprint = f"expired-{row['batch_id']}-{row['expiry_date']}"
-                message = f"{row['name']} batch {row['batch_number']} has expired."
-                connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'expired', message, row['batch_id'], fingerprint))
-                connection.execute('UPDATE notifications SET message = ? WHERE user_id = ? AND fingerprint = ?', (message, user_id, fingerprint))
+    if reorder_enabled:
+        products = connection.execute('''SELECT p.id, p.name, p.low_stock_threshold,
+            COALESCE(SUM(b.quantity_remaining), 0) stock, MIN(b.expiry_date) next_expiry
+            FROM products p LEFT JOIN product_batches b
+            ON b.product_id = p.id AND b.user_id = p.user_id
+                AND b.quantity_remaining > 0
+                AND (b.expiry_date IS NULL OR b.expiry_date > ?)
+            WHERE p.user_id = ?
+            GROUP BY p.id, p.name, p.low_stock_threshold''', (today.isoformat(), user_id)).fetchall()
+        for product in products:
+            if product['stock'] > product['low_stock_threshold']:
+                continue
+            suggested = _suggest_reorder_quantity(connection, user_id, product['id'], product['stock'], product['low_stock_threshold'])
+            next_expiry = f" Next eligible batch expires {product['next_expiry']}." if product['next_expiry'] else ' No dated eligible batch expiry is recorded.'
+            message = f"{product['name']} is below the reorder threshold. Stock: {product['stock']} / Suggested reorder: {suggested} units.{next_expiry}"
+            fingerprint = f"reorder-{product['id']}"
+            connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'reorder', message, product['id'], fingerprint))
+            connection.execute('UPDATE notifications SET message = ?, is_read = 0 WHERE user_id = ? AND fingerprint = ?', (message, user_id, fingerprint))
+
+    batches = connection.execute('''SELECT p.name, b.id batch_id, b.batch_number, b.expiry_date
+        FROM products p JOIN product_batches b ON b.product_id = p.id AND b.user_id = p.user_id
+        WHERE p.user_id = ? AND b.quantity_remaining > 0 AND b.expiry_date IS NOT NULL''', (user_id,)).fetchall()
+    for batch in batches:
+        try:
+            days = (datetime.fromisoformat(batch['expiry_date']).date() - today).days
+        except ValueError:
+            days = None
+        if days is not None and 0 < days <= 30:
+            fingerprint = f"expiry-{batch['batch_id']}-{batch['expiry_date']}"
+            message = f"{batch['name']} batch {batch['batch_number']} will expire in {days} days."
+            connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'expiry', message, batch['batch_id'], fingerprint))
+            connection.execute('UPDATE notifications SET message = ? WHERE user_id = ? AND fingerprint = ?', (message, user_id, fingerprint))
+        elif days is not None and days <= 0:
+            fingerprint = f"expired-{batch['batch_id']}-{batch['expiry_date']}"
+            message = f"{batch['name']} batch {batch['batch_number']} has expired."
+            connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'expired', message, batch['batch_id'], fingerprint))
+            connection.execute('UPDATE notifications SET message = ? WHERE user_id = ? AND fingerprint = ?', (message, user_id, fingerprint))
     pending = connection.execute("SELECT id, invoice_number, total FROM invoices WHERE user_id = ? AND payment_status = 'Pending'", (user_id,)).fetchall()
     for invoice in pending:
         connection.execute('INSERT OR IGNORE INTO notifications(user_id, type, message, related_id, fingerprint) VALUES (?, ?, ?, ?, ?)', (user_id, 'pending_payment', f"Invoice {invoice['invoice_number']} is pending payment.", invoice['id'], f"pending-{invoice['id']}"))
@@ -210,13 +268,17 @@ def _notify_inventory(connection, user_id):
 def get_reorder_products(user=Depends(current_user), product_id: Optional[int] = Query(default=None)):
     connection = get_connection()
     try:
+        require_enabled(_auto_reorder_enabled(connection, user['id']), 'Auto reorder alerts')
         query = '''SELECT p.id, p.name, p.category, p.low_stock_threshold, COALESCE(SUM(b.quantity_remaining), 0) stock,
+            MIN(b.expiry_date) soonest_expiry,
             MAX(CASE WHEN b.supplier IS NOT NULL AND trim(b.supplier) <> '' THEN b.supplier END) supplier,
             MAX(b.purchase_price) purchase_price
             FROM products p LEFT JOIN product_batches b ON b.product_id = p.id AND b.user_id = p.user_id
+                AND b.quantity_remaining > 0
+                AND (b.expiry_date IS NULL OR b.expiry_date > ?)
             WHERE p.user_id = ?
             GROUP BY p.id, p.name, p.category, p.low_stock_threshold'''
-        params = [user['id']]
+        params = [now_local().date().isoformat(), user['id']]
         if product_id is not None:
             query += ' HAVING p.id = ?'
             params.append(product_id)
@@ -227,6 +289,9 @@ def get_reorder_products(user=Depends(current_user), product_id: Optional[int] =
             if current_stock > row['low_stock_threshold']:
                 continue
             suggested = _suggest_reorder_quantity(connection, user['id'], row['id'], current_stock, row['low_stock_threshold'])
+            expiry_quantity = 0
+            if row['soonest_expiry']:
+                expiry_quantity = connection.execute('SELECT COALESCE(SUM(quantity_remaining), 0) quantity FROM product_batches WHERE user_id = ? AND product_id = ? AND expiry_date = ? AND quantity_remaining > 0', (user['id'], row['id'], row['soonest_expiry'])).fetchone()['quantity']
             result.append({
                 'id': row['id'],
                 'name': row['name'],
@@ -235,6 +300,8 @@ def get_reorder_products(user=Depends(current_user), product_id: Optional[int] =
                 'low_stock_threshold': row['low_stock_threshold'],
                 'supplier': row['supplier'],
                 'purchase_price': row['purchase_price'],
+                'soonest_expiry': row['soonest_expiry'],
+                'soonest_expiry_quantity': expiry_quantity,
                 'suggested_order_quantity': suggested,
                 'recommended_order_quantity': suggested,
             })
@@ -377,21 +444,23 @@ def get_preferences(user=Depends(current_user)):
     connection = get_connection()
     connection.execute('INSERT OR IGNORE INTO user_preferences(user_id) VALUES (?)', (user['id'],))
     connection.commit()
-    row = connection.execute('SELECT auto_reorder_alerts, ai_suggestions FROM user_preferences WHERE user_id = ?', (user['id'],)).fetchone()
+    row = connection.execute('SELECT auto_reorder_alerts, ai_suggestions, region FROM user_preferences WHERE user_id = ?', (user['id'],)).fetchone()
     connection.close()
-    return {'auto_reorder_alerts': bool(row['auto_reorder_alerts']), 'ai_suggestions': bool(row['ai_suggestions'])}
+    return {'auto_reorder_alerts': bool(row['auto_reorder_alerts']), 'ai_suggestions': bool(row['ai_suggestions']), 'region': row['region']}
 
 
 @app.put('/preferences')
 def update_preferences(payload: PreferencesRequest, user=Depends(current_user)):
+    if payload.region and payload.region not in INDIAN_REGIONS:
+        raise HTTPException(status_code=422, detail='Select a valid Indian state or union territory code.')
     connection = get_connection()
-    connection.execute('''INSERT INTO user_preferences(user_id, auto_reorder_alerts, ai_suggestions)
-        VALUES (?, ?, ?)
+    connection.execute('''INSERT INTO user_preferences(user_id, auto_reorder_alerts, ai_suggestions, region)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET auto_reorder_alerts = excluded.auto_reorder_alerts,
-        ai_suggestions = excluded.ai_suggestions, updated_at = CURRENT_TIMESTAMP''', (user['id'], int(payload.auto_reorder_alerts), int(payload.ai_suggestions)))
+        ai_suggestions = excluded.ai_suggestions, region = excluded.region, updated_at = CURRENT_TIMESTAMP''', (user['id'], int(payload.auto_reorder_alerts), int(payload.ai_suggestions), payload.region))
     connection.commit()
     connection.close()
-    return {'auto_reorder_alerts': payload.auto_reorder_alerts, 'ai_suggestions': payload.ai_suggestions}
+    return {'auto_reorder_alerts': payload.auto_reorder_alerts, 'ai_suggestions': payload.ai_suggestions, 'region': payload.region}
 
 
 @app.get('/products')
@@ -462,6 +531,60 @@ def add_batch(product_id: int, payload: BatchRequest, user=Depends(current_user)
         connection.close()
 
 
+@app.post('/products/{product_id}/batches/{batch_id}/discard')
+def discard_batch(product_id: int, batch_id: int, payload: DiscardBatchRequest, user=Depends(current_user)):
+    if payload.reason != 'Other' and payload.note and payload.note.strip():
+        raise HTTPException(status_code=422, detail='A note can only be provided when the reason is Other.')
+    note = payload.note.strip() if payload.note and payload.reason == 'Other' else None
+    connection = get_connection()
+    try:
+        connection.execute('BEGIN IMMEDIATE')
+        batch = connection.execute('''SELECT b.id, b.product_id, b.batch_number, b.quantity_remaining,
+            p.name product_name
+            FROM product_batches b JOIN products p ON p.id = b.product_id
+            WHERE b.id = ? AND b.product_id = ? AND b.user_id = ? AND p.user_id = ?''',
+            (batch_id, product_id, user['id'], user['id'])).fetchone()
+        if not batch:
+            raise HTTPException(status_code=404, detail='Inventory batch not found.')
+        if batch['quantity_remaining'] <= 0:
+            raise HTTPException(status_code=409, detail='This batch has no remaining stock to discard.')
+        if batch['quantity_remaining'] != payload.expected_quantity:
+            raise HTTPException(status_code=409, detail=f"Batch quantity changed. Current remaining quantity: {batch['quantity_remaining']} units. Refresh inventory and try again.")
+
+        updated = connection.execute('''UPDATE product_batches SET quantity_remaining = 0
+            WHERE id = ? AND product_id = ? AND user_id = ? AND quantity_remaining = ?''',
+            (batch_id, product_id, user['id'], payload.expected_quantity))
+        if not updated.rowcount:
+            raise HTTPException(status_code=409, detail='Batch stock changed while processing. Refresh inventory and try again.')
+        cursor = connection.execute('''INSERT INTO inventory_adjustments(
+            user_id, product_id, batch_id, quantity, reason, note
+        ) VALUES (?, ?, ?, ?, ?, ?)''',
+            (user['id'], product_id, batch_id, payload.expected_quantity, payload.reason, note))
+        product = _product_json(connection, user['id'], _product_row(connection, user['id'], product_id))
+        response = {
+            'message': f"{batch['quantity_remaining']} units discarded from {batch['product_name']} batch {batch['batch_number']}.",
+            'adjustment': {
+                'id': cursor.lastrowid,
+                'product_id': product_id,
+                'batch_id': batch_id,
+                'quantity': payload.expected_quantity,
+                'reason': payload.reason,
+                'note': note,
+            },
+            'product': product,
+        }
+        connection.commit()
+        return response
+    except HTTPException:
+        connection.rollback()
+        raise
+    except Exception as error:
+        connection.rollback()
+        raise HTTPException(status_code=500, detail=f'Unable to discard batch: {error}')
+    finally:
+        connection.close()
+
+
 @app.put('/products/{product_id}')
 def update_product(product_id: int, payload: ProductRequest, user=Depends(current_user)):
     connection = get_connection()
@@ -477,6 +600,10 @@ def update_product(product_id: int, payload: ProductRequest, user=Depends(curren
 def delete_product(product_id: int, user=Depends(current_user)):
     connection = get_connection()
     _product_row(connection, user['id'], product_id)
+    adjusted = connection.execute('SELECT 1 FROM inventory_adjustments WHERE product_id = ? LIMIT 1', (product_id,)).fetchone()
+    if adjusted:
+        connection.close()
+        raise HTTPException(status_code=400, detail='Products with inventory adjustment history cannot be deleted')
     used = connection.execute('SELECT 1 FROM invoice_items WHERE product_id = ? LIMIT 1', (product_id,)).fetchone()
     if used:
         connection.close()
@@ -564,22 +691,19 @@ def create_invoice(payload: InvoiceRequest, user=Depends(current_user)):
     connection = get_connection()
     try:
         requested = {}
+        connection.execute('BEGIN IMMEDIATE')
         for item in payload.items:
             requested[item.product_id] = requested.get(item.product_id, 0) + item.quantity
         allocations = []
         for product_id, quantity in requested.items():
             _product_row(connection, user['id'], product_id)
-            batches = connection.execute('SELECT b.*, p.name product_name FROM product_batches b JOIN products p ON p.id = b.product_id WHERE b.product_id = ? AND b.user_id = ? AND b.quantity_remaining > 0 AND (b.expiry_date IS NULL OR b.expiry_date > ?) ORDER BY b.expiry_date IS NULL, b.expiry_date, b.id', (product_id, user['id'], now_local().date().isoformat())).fetchall()
-            remaining = quantity
-            for batch in batches:
-                take = min(remaining, batch['quantity_remaining'])
-                if take:
-                    allocations.append((batch, take))
-                    remaining -= take
-                if remaining == 0:
-                    break
-            if remaining:
-                raise HTTPException(status_code=400, detail=f'Insufficient stock for product {product_id}')
+            sale_date = now_local().date()
+            batches = connection.execute('SELECT b.*, p.name product_name FROM product_batches b JOIN products p ON p.id = b.product_id WHERE b.product_id = ? AND b.user_id = ? AND b.quantity_remaining > 0 AND (b.expiry_date IS NULL OR b.expiry_date > ?)', (product_id, user['id'], sale_date.isoformat())).fetchall()
+            try:
+                allocations.extend(allocate_fefo_batches(batches, quantity, sale_date))
+            except InsufficientStockError as error:
+                product = _product_row(connection, user['id'], product_id)
+                raise HTTPException(status_code=400, detail=f"Insufficient eligible stock for {product['name']}: {error.available} units available.") from error
 
         customer = None
         if payload.customer_id:
@@ -604,7 +728,9 @@ def create_invoice(payload: InvoiceRequest, user=Depends(current_user)):
         for batch, quantity in allocations:
             amount = batch['selling_price'] * quantity
             cost = batch['purchase_price'] * quantity
-            connection.execute('UPDATE product_batches SET quantity_remaining = quantity_remaining - ? WHERE id = ? AND user_id = ?', (quantity, batch['id'], user['id']))
+            updated = connection.execute('UPDATE product_batches SET quantity_remaining = quantity_remaining - ? WHERE id = ? AND user_id = ? AND quantity_remaining >= ?', (quantity, batch['id'], user['id'], quantity))
+            if not updated.rowcount:
+                raise HTTPException(status_code=409, detail='Stock changed while completing the sale. Please retry.')
             connection.execute('INSERT INTO invoice_items(invoice_id, product_id, batch_id, product_name, batch_number, quantity, selling_price, purchase_price, amount, cost, profit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (invoice_id, batch['product_id'], batch['id'], batch['product_name'], batch['batch_number'], quantity, batch['selling_price'], batch['purchase_price'], amount, cost, amount - cost))
             connection.execute('INSERT INTO sales(user_id, invoice_id, product_id, batch_id, customer_id, quantity, revenue, cost, profit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (user['id'], invoice_id, batch['product_id'], batch['id'], customer_id, quantity, amount, cost, amount - cost))
         now = now_local().isoformat()
@@ -769,7 +895,11 @@ def reports(user=Depends(current_user), start: Optional[str] = None, end: Option
 def notifications(user=Depends(current_user)):
     connection = get_connection()
     _notify_inventory(connection, user['id'])
-    rows = connection.execute('SELECT * FROM notifications WHERE user_id = ? ORDER BY is_read, created_at DESC LIMIT 30', (user['id'],)).fetchall()
+    auto_reorder_enabled = _auto_reorder_enabled(connection, user['id'])
+    if auto_reorder_enabled:
+        rows = connection.execute('SELECT * FROM notifications WHERE user_id = ? ORDER BY is_read, created_at DESC LIMIT 30', (user['id'],)).fetchall()
+    else:
+        rows = connection.execute("SELECT * FROM notifications WHERE user_id = ? AND type != 'reorder' ORDER BY is_read, created_at DESC LIMIT 30", (user['id'],)).fetchall()
     today = now_local().date()
     result = []
     for row in rows:
@@ -779,6 +909,21 @@ def notifications(user=Depends(current_user)):
             if batch and batch['expiry_date']:
                 item['expiry_date'] = batch['expiry_date']
                 item['days_remaining'] = (datetime.fromisoformat(batch['expiry_date']).date() - today).days
+        if item['type'] == 'reorder':
+            product = connection.execute('SELECT id, name, category, low_stock_threshold FROM products WHERE id = ? AND user_id = ?', (item['related_id'], user['id'])).fetchone()
+            if product:
+                stock = connection.execute('SELECT COALESCE(SUM(quantity_remaining), 0) stock FROM product_batches WHERE product_id = ? AND user_id = ? AND (expiry_date IS NULL OR expiry_date > ?)', (item['related_id'], user['id'], today.isoformat())).fetchone()['stock']
+                item['current_stock'] = stock
+                item['suggested_order_quantity'] = _suggest_reorder_quantity(connection, user['id'], item['related_id'], stock, product['low_stock_threshold'])
+                item['product_name'] = product['name']
+                next_batch = connection.execute('''SELECT expiry_date, SUM(quantity_remaining) quantity
+                    FROM product_batches WHERE product_id = ? AND user_id = ? AND quantity_remaining > 0
+                    AND expiry_date IS NOT NULL AND expiry_date > ?
+                    GROUP BY expiry_date ORDER BY expiry_date LIMIT 1''', (item['related_id'], user['id'], today.isoformat())).fetchone()
+                if next_batch:
+                    item['expiry_date'] = next_batch['expiry_date']
+                    item['expiry_quantity'] = next_batch['quantity']
+                    item['days_remaining'] = (datetime.fromisoformat(next_batch['expiry_date']).date() - today).days
         result.append(item)
     connection.commit()
     connection.close()
@@ -805,4 +950,140 @@ def mark_notification_read(notification_id: int, user=Depends(current_user)):
 
 @app.get('/ai/suggestions')
 def get_ai_suggestions(user=Depends(current_user)):
+    connection = get_connection()
+    enabled = _ai_suggestions_enabled(connection, user['id'])
+    connection.close()
+    require_enabled(enabled, 'AI suggestions')
     return {'suggestions': ['Review low-stock items and prioritize the products with the nearest expiry date.']}
+
+
+@app.get('/ai/festival-insights')
+def get_festival_insights(user=Depends(current_user)):
+    connection = get_connection()
+    try:
+        preference = connection.execute(
+            'SELECT ai_suggestions, region FROM user_preferences WHERE user_id = ?',
+            (user['id'],),
+        ).fetchone()
+        require_enabled(not preference or bool(preference['ai_suggestions']), 'AI suggestions')
+
+        today = india_today()
+        region = preference['region'] if preference else None
+        try:
+            festivals = filter_upcoming_festivals(upcoming_festivals(today, region), today)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+        product_rows = connection.execute('''SELECT p.id, p.name, p.category, p.low_stock_threshold,
+            b.id batch_id, b.expiry_date, b.quantity_remaining
+            FROM products p LEFT JOIN product_batches b
+            ON b.product_id = p.id AND b.user_id = p.user_id
+                AND NOT EXISTS (
+                    SELECT 1 FROM inventory_adjustments adjustment
+                    WHERE adjustment.batch_id = b.id
+                        AND adjustment.product_id = b.product_id
+                        AND adjustment.user_id = b.user_id
+                )
+            WHERE p.user_id = ?
+            ORDER BY p.id, b.expiry_date IS NULL, b.expiry_date, b.id''', (user['id'],)).fetchall()
+        sales_rows = connection.execute('''SELECT product_id, SUM(quantity) quantity, COUNT(DISTINCT date(sold_at)) sale_days
+            FROM sales WHERE user_id = ? AND sold_at >= datetime('now', '-90 days')
+            GROUP BY product_id''', (user['id'],)).fetchall()
+        sales_by_product = {row['product_id']: row for row in sales_rows}
+        inventory = {}
+        for row in product_rows:
+            product = inventory.setdefault(row['id'], {
+                'id': row['id'],
+                'name': row['name'],
+                'category': row['category'] or '',
+                'low_stock_threshold': row['low_stock_threshold'],
+                'batches': [],
+            })
+            if row['batch_id'] is not None:
+                product['batches'].append(row)
+
+        for festival in festivals:
+            matched_products = []
+            festival_date = date.fromisoformat(festival['date'])
+            festival['suggested_categories'] = festival_category_labels(festival['name'])
+            for product in inventory.values():
+                if not product_matches_festival_category(
+                    festival['name'],
+                    product['category'],
+                    product['name'],
+                ):
+                    continue
+                eligible_stock = sum(
+                    int(batch['quantity_remaining'])
+                    for batch in product['batches']
+                    if batch['quantity_remaining'] > 0
+                    and (
+                        not batch['expiry_date']
+                        or date.fromisoformat(batch['expiry_date']) > festival_date
+                    )
+                )
+                history = sales_by_product.get(product['id'])
+                quantity_sold = int(history['quantity']) if history else 0
+                sale_days = int(history['sale_days']) if history else 0
+                enough_history = sale_days >= 30
+                if enough_history:
+                    estimated_demand = max(
+                        product['low_stock_threshold'],
+                        math.ceil(quantity_sold / 90 * festival['preparation_window_days'] * 1.5),
+                    )
+                else:
+                    estimated_demand = product['low_stock_threshold']
+                soon_expiring = sum(
+                    int(batch['quantity_remaining'])
+                    for batch in product['batches']
+                    if batch['quantity_remaining'] > 0
+                    if batch['expiry_date']
+                    and today < date.fromisoformat(batch['expiry_date']) <= festival_date
+                )
+                matched_products.append({
+                    'id': product['id'],
+                    'name': product['name'],
+                    'category': product['category'],
+                    'current_stock': eligible_stock,
+                    'quantity_sold_last_90_days': quantity_sold if enough_history else None,
+                    'sales_history_sufficient': enough_history,
+                    'suggested_reorder_quantity': max(0, estimated_demand - eligible_stock) if enough_history else 0,
+                    'quantity_expiring_in_preparation_window': soon_expiring,
+                    'estimated_demand_units': estimated_demand if enough_history else None,
+                })
+            festival['products'] = matched_products
+            festival['sales_history_sufficient'] = any(
+                product['sales_history_sufficient'] for product in matched_products
+            )
+            if not festival['sales_history_sufficient']:
+                festival['reason'] += ' Matching recommendations are general; there is not enough store-specific sales history for demand estimates.'
+
+        safe_context = [{
+            'festival': festival['name'],
+            'date': festival['date'],
+            'inventory': [{
+                'product': re.sub(r'[\x00-\x1f\x7f]', ' ', str(product['name']))[:80],
+                'category': re.sub(r'[\x00-\x1f\x7f]', ' ', str(product['category']))[:80],
+                'stock': product['current_stock'],
+                'sales_90_days': product['quantity_sold_last_90_days'],
+                'expiring_soon': product['quantity_expiring_in_preparation_window'],
+            } for product in festival['products'][:8]],
+        } for festival in festivals[:8]]
+        explanation = None
+        if safe_context:
+            explanation = get_ai_suggestion(
+                'Summarize the supplied festival and inventory data for a retailer in one cautious paragraph. '
+                'Use only the supplied facts, label demand as an estimate, and do not guarantee sales or suggest automatic stock changes. '
+                f'Data: {json.dumps(safe_context, ensure_ascii=True)}',
+                max_tokens=180,
+            )
+        safe_explanation = re.sub(r'[\x00-\x08\x0b-\x1f\x7f]', ' ', explanation).strip()[:1000] if explanation else None
+        return {
+            'festivals': festivals,
+            'region': region,
+            'ai_assisted': bool(safe_explanation),
+            'ai_summary': safe_explanation,
+            'estimate_disclaimer': 'Demand and reorder quantities are estimates, not guaranteed sales. No inventory changes are made automatically.',
+        }
+    finally:
+        connection.close()

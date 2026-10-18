@@ -25,7 +25,6 @@ export default function TopNavbar({ darkMode, onToggleTheme }) {
   }, [darkMode])
 
   useEffect(() => {
-    setUser(getStoredUser())
     apiFetch('/notifications').then(setNotifications).catch(() => setNotifications([]))
   }, [])
 
@@ -37,7 +36,7 @@ export default function TopNavbar({ darkMode, onToggleTheme }) {
 
   const handleNotificationClick = async (item) => {
     if (item.is_read) {
-      if (item.type === 'reorder') navigate('/inventory', { state: { inventoryFilter: 'reorder', reorderProductId: item.related_id } })
+      if (item.type === 'reorder') navigate('/inventory', { state: { inventoryFilter: 'reorder', reorderProductId: item.related_id, prefillQuantity: item.suggested_order_quantity } })
       return
     }
 
@@ -49,7 +48,7 @@ export default function TopNavbar({ darkMode, onToggleTheme }) {
     }
 
     if (item.type === 'reorder') {
-      navigate('/inventory', { state: { inventoryFilter: 'reorder', reorderProductId: item.related_id } })
+      navigate('/inventory', { state: { inventoryFilter: 'reorder', reorderProductId: item.related_id, prefillQuantity: item.suggested_order_quantity } })
     }
   }
 
@@ -72,7 +71,7 @@ export default function TopNavbar({ darkMode, onToggleTheme }) {
             <Bell size={18} />
             {notifications.filter((item) => !item.is_read).length > 0 && <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] text-white">{notifications.filter((item) => !item.is_read).length}</span>}
           </button>
-          {notificationsOpen && <div className="absolute right-0 z-50 mt-3 w-80 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-800 dark:bg-slate-900"><div className="flex items-center justify-between px-2"><p className="font-semibold text-slate-900 dark:text-white">Notifications</p>{notifications.some((item) => !item.is_read) && <button type="button" onClick={async () => { try { await apiFetch('/notifications/read-all', { method: 'PATCH' }); setNotifications((items) => items.map((item) => ({ ...item, is_read: 1 }))) } catch { setNotifications((items) => items) } }} className="!m-0 !bg-transparent !p-0 !text-xs !text-cyan-700 dark:!text-cyan-400">Mark all read</button>}</div><div className="mt-2 max-h-80 space-y-1 overflow-auto">{notifications.some((item) => !item.is_read) ? notifications.map((item) => <button type="button" key={item.id} onClick={() => handleNotificationClick(item)} className={`!m-0 !block !w-full !rounded-xl !p-3 !text-left ${item.is_read ? '!bg-transparent' : '!bg-cyan-50 dark:!bg-cyan-950/30'}`}><p className="text-sm text-slate-900 dark:text-white">{item.message}</p>{item.expiry_date && <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">Expiry: {item.expiry_date} · {item.days_remaining} days remaining</p>}<p className="mt-1 text-[11px] uppercase text-slate-500 dark:text-slate-400">{item.type === 'reorder' ? 'reorder alert' : item.type.replace('_', ' ')}</p></button>) : <p className="px-2 py-4 text-sm text-slate-500 dark:text-slate-400">No new notifications.</p>}</div></div>}
+          {notificationsOpen && <div className="absolute right-0 z-50 mt-3 w-80 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-800 dark:bg-slate-900"><div className="flex items-center justify-between px-2"><p className="font-semibold text-slate-900 dark:text-white">Notifications</p>{notifications.some((item) => !item.is_read) && <button type="button" onClick={async () => { try { await apiFetch('/notifications/read-all', { method: 'PATCH' }); setNotifications((items) => items.map((item) => ({ ...item, is_read: 1 }))) } catch { setNotifications((items) => items) } }} className="!m-0 !bg-transparent !p-0 !text-xs !text-cyan-700 dark:!text-cyan-400">Mark all read</button>}</div><div className="mt-2 max-h-80 space-y-1 overflow-auto">{notifications.some((item) => !item.is_read) ? notifications.map((item) => <button type="button" key={item.id} onClick={() => handleNotificationClick(item)} className={`!m-0 !block !w-full !rounded-xl !p-3 !text-left ${item.is_read ? '!bg-transparent' : '!bg-cyan-50 dark:!bg-cyan-950/30'}`}><p className="text-sm text-slate-900 dark:text-white">{item.message}</p>{item.expiry_date && <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{item.type === 'reorder' ? 'Next eligible expiry' : 'Expiry'}: {item.expiry_date}{item.expiry_quantity ? ` · ${item.expiry_quantity} units · ` : ' · '}{item.days_remaining} days remaining</p>}<p className="mt-1 text-[11px] uppercase text-slate-500 dark:text-slate-400">{item.type === 'reorder' ? 'reorder alert' : item.type.replace('_', ' ')}</p></button>) : <p className="px-2 py-4 text-sm text-slate-500 dark:text-slate-400">No new notifications.</p>}</div></div>}
         </div>
         <button
           onClick={onToggleTheme}

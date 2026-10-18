@@ -140,6 +140,16 @@ def _create_schema(connection):
         ai_suggestions INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS inventory_adjustments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        product_id INTEGER NOT NULL REFERENCES products(id),
+        batch_id INTEGER NOT NULL REFERENCES product_batches(id),
+        quantity INTEGER NOT NULL CHECK(quantity > 0),
+        reason TEXT NOT NULL CHECK(reason IN ('Expired', 'Damaged', 'Other')),
+        note TEXT,
+        adjusted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE INDEX IF NOT EXISTS idx_products_user ON products(user_id);
     CREATE INDEX IF NOT EXISTS idx_batches_product_expiry ON product_batches(product_id, expiry_date);
     CREATE INDEX IF NOT EXISTS idx_customers_user_mobile ON customers(user_id, mobile);
@@ -147,7 +157,10 @@ def _create_schema(connection):
     CREATE INDEX IF NOT EXISTS idx_sales_user_date ON sales(user_id, sold_at);
     CREATE INDEX IF NOT EXISTS idx_categories_user ON categories(user_id);
     CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_inventory_adjustments_batch ON inventory_adjustments(batch_id, adjusted_at);
     ''')
+    if 'region' not in _columns(connection, 'user_preferences'):
+        connection.execute('ALTER TABLE user_preferences ADD COLUMN region TEXT')
 
 
 def _deduplicate_categories(connection):
