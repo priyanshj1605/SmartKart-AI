@@ -1,4 +1,4 @@
-import { NavLink } from 'react-router-dom'
+import { Link, NavLink } from 'react-router-dom'
 import { LayoutGrid, Boxes, Users, BadgeDollarSign, BarChart3, Sparkles, Settings, FileText, Receipt, LogIn } from 'lucide-react'
 import SmartKartLogo from '../common/SmartKartLogo'
 
@@ -17,9 +17,9 @@ const navItems = [
 export default function Sidebar({ isDarkMode }) {
   return (
     <aside className="flex min-h-screen w-72 flex-col border-r border-slate-200 bg-white/95 p-6 shadow-sm dark:border-slate-800 dark:bg-slate-950/95">
-      <div className="flex h-36 items-center justify-center rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-4">
+      <Link to="/dashboard" aria-label="Go to Dashboard" title="Go to Dashboard" className="flex h-36 items-center justify-center rounded-2xl border border-cyan-500/20 bg-cyan-500/10 p-4">
         <SmartKartLogo isDarkMode={isDarkMode} className="h-full w-full max-w-[210px]" />
-      </div>
+      </Link>
 
       <nav className="mt-8 space-y-2">
         {navItems.map(({ to, label, icon: Icon }) => (
