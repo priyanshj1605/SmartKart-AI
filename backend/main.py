@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from threading import Lock
 import hashlib
 import json
@@ -723,7 +723,8 @@ def create_invoice(payload: InvoiceRequest, user=Depends(current_user)):
         profit = subtotal - purchase_cost - payload.discount
         last_invoice = connection.execute("SELECT MAX(CAST(SUBSTR(invoice_number, 5) AS INTEGER)) number FROM invoices WHERE user_id = ? AND invoice_number LIKE 'INV-%'", (user['id'],)).fetchone()['number'] or 1000
         invoice_number = f'INV-{last_invoice + 1}'
-        cursor = connection.execute('INSERT INTO invoices(user_id, customer_id, invoice_number, subtotal, discount, tax, total, purchase_cost, profit, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (user['id'], customer_id, invoice_number, subtotal, payload.discount, payload.tax, total, purchase_cost, profit, payload.payment_status))
+        created_at = datetime.now(timezone.utc).isoformat(sep=' ', timespec='microseconds')
+        cursor = connection.execute('INSERT INTO invoices(user_id, customer_id, invoice_number, subtotal, discount, tax, total, purchase_cost, profit, payment_status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (user['id'], customer_id, invoice_number, subtotal, payload.discount, payload.tax, total, purchase_cost, profit, payload.payment_status, created_at))
         invoice_id = cursor.lastrowid
         for batch, quantity in allocations:
             amount = batch['selling_price'] * quantity
@@ -732,9 +733,8 @@ def create_invoice(payload: InvoiceRequest, user=Depends(current_user)):
             if not updated.rowcount:
                 raise HTTPException(status_code=409, detail='Stock changed while completing the sale. Please retry.')
             connection.execute('INSERT INTO invoice_items(invoice_id, product_id, batch_id, product_name, batch_number, quantity, selling_price, purchase_price, amount, cost, profit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (invoice_id, batch['product_id'], batch['id'], batch['product_name'], batch['batch_number'], quantity, batch['selling_price'], batch['purchase_price'], amount, cost, amount - cost))
-            connection.execute('INSERT INTO sales(user_id, invoice_id, product_id, batch_id, customer_id, quantity, revenue, cost, profit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (user['id'], invoice_id, batch['product_id'], batch['id'], customer_id, quantity, amount, cost, amount - cost))
-        now = now_local().isoformat()
-        connection.execute('UPDATE customers SET visit_count = visit_count + 1, last_purchase = ?, total_purchase = total_purchase + ?, total_invoices = total_invoices + 1 WHERE id = ? AND user_id = ?', (now, total, customer_id, user['id']))
+            connection.execute('INSERT INTO sales(user_id, invoice_id, product_id, batch_id, customer_id, quantity, revenue, cost, profit, sold_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (user['id'], invoice_id, batch['product_id'], batch['id'], customer_id, quantity, amount, cost, amount - cost, created_at))
+        connection.execute('UPDATE customers SET visit_count = visit_count + 1, last_purchase = ?, total_purchase = total_purchase + ?, total_invoices = total_invoices + 1 WHERE id = ? AND user_id = ?', (created_at, total, customer_id, user['id']))
         connection.commit()
         return get_invoice(invoice_id, user)
     except HTTPException:

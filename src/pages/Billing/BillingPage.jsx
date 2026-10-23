@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Barcode, CheckCircle2, PackagePlus, Search, Trash2, UserRound } from 'lucide-react'
 import { apiFetch, jsonBody } from '../../services/api'
 import ScannerModal from '../../components/common/ScannerModal'
+import { formatIndiaDateTime } from '../../utils/date'
 
 const money = (value) => `₹${Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
 const fieldClass = 'w-full rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white'
@@ -69,7 +70,7 @@ export default function BillingPage() {
     setSaving(true)
     try {
       const invoice = await apiFetch('/invoices', { method: 'POST', body: jsonBody({ customer, payment_status: paymentStatus, items: items.map((item) => ({ product_id: item.product_id, quantity: item.quantity })) }) })
-      setMessage(`${invoice.invoice_number} completed successfully.`); setCustomer({ name: '', mobile: '', address: '', email: '' }); setItems([]); setPaymentStatus('Paid')
+      setMessage(`${invoice.invoice_number} completed successfully at ${formatIndiaDateTime(invoice.created_at)}.`); setCustomer({ name: '', mobile: '', address: '', email: '' }); setItems([]); setPaymentStatus('Paid')
     } catch (submitError) { setError(submitError.message) } finally { setSaving(false) }
   }
   const handleScan = (code) => { setProductQuery(code); setScannerOpen(false) }

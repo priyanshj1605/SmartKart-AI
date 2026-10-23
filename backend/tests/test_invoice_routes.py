@@ -109,13 +109,29 @@ class InvoiceRouteTests(unittest.TestCase):
         self.assertEqual(invoice['subtotal'], 44)
         self.assertEqual(invoice['purchase_cost'], 28)
         self.assertEqual(invoice['profit'], 16)
+        self.assertTrue(invoice['created_at'].endswith('+00:00'))
+        self.assertEqual(datetime.fromisoformat(invoice['created_at']).tzinfo, timezone.utc)
         self.assertEqual(
             [(item['batch_number'], item['quantity'], item['selling_price']) for item in invoice['items']],
             [('EARLY', 2, 10), ('LATE', 2, 12)],
         )
         with closing(self.get_connection()) as connection:
             remaining = connection.execute('SELECT id, quantity_remaining FROM product_batches ORDER BY id').fetchall()
+            sales_timestamps = {
+                row['sold_at'] for row in connection.execute('SELECT sold_at FROM sales WHERE invoice_id = ?', (invoice['id'],))
+            }
+        self.assertEqual(sales_timestamps, {invoice['created_at']})
         self.assertEqual([(row['id'], row['quantity_remaining']) for row in remaining], [(1, 0), (2, 1)])
+
+    def test_legacy_invoice_timestamp_is_preserved_by_detail_and_list_reads(self):
+        invoice = main.create_invoice(self.make_invoice(1), self.user)
+        legacy_timestamp = '2020-01-02 03:04:05'
+        with closing(self.get_connection()) as connection:
+            connection.execute('UPDATE invoices SET created_at = ? WHERE id = ?', (legacy_timestamp, invoice['id']))
+            connection.commit()
+
+        self.assertEqual(main.get_invoice(invoice['id'], self.user)['created_at'], legacy_timestamp)
+        self.assertEqual(main.get_invoices(self.user)[0]['created_at'], legacy_timestamp)
 
     def test_insufficient_eligible_stock_rolls_back_sale(self):
         with closing(self.get_connection()) as connection:

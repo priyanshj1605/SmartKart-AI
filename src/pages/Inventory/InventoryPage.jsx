@@ -47,6 +47,7 @@ export default function InventoryPage() {
   const location = useLocation()
   const [products, setProducts] = useState([])
   const [form, setForm] = useState(initialForm)
+  const [productSuggestionsOpen, setProductSuggestionsOpen] = useState(true)
   const [showForm, setShowForm] = useState(false)
   const [scannerOpen, setScannerOpen] = useState(false)
   const [search, setSearch] = useState(() => location.state?.inventorySearch || '')
@@ -119,7 +120,8 @@ export default function InventoryPage() {
     return suppliers.filter((supplier) => supplier.toLowerCase().includes(value)).slice(0, 8)
   }, [form.supplier, suppliers])
   const filteredProducts = useMemo(() => {
-    let result = categoryFilter ? products.filter((product) => product.category === categoryFilter) : products
+    let result = products
+    if (categoryFilter) result = result.filter((product) => product.category === categoryFilter)
     if (!filter) return result
     const today = new Date().toISOString().slice(0, 10)
     const alertDate = new Date()
@@ -128,7 +130,7 @@ export default function InventoryPage() {
     if (filter === 'low-stock') return result.filter((product) => product.status === 'Low Stock' || product.status === 'Out of Stock')
     return result.filter((product) => product.batches.some((batch) => batch.quantity_remaining > 0 && batch.expiry_date > today && batch.expiry_date <= alertDateString))
   }, [categoryFilter, filter, products])
-  const matchingNames = form.name.length > 1 ? products.filter((product) => product.name.toLowerCase().includes(form.name.toLowerCase())).slice(0, 5) : []
+  const matchingNames = productSuggestionsOpen && form.name.length > 1 ? products.filter((product) => product.name.toLowerCase().includes(form.name.toLowerCase())).slice(0, 5) : []
 
   const addProduct = async (event) => {
     event.preventDefault()
@@ -192,7 +194,7 @@ export default function InventoryPage() {
   return <section className="space-y-6">
     <div className="rounded-3xl border border-slate-200 bg-white/80 p-6 dark:border-slate-800 dark:bg-slate-900/80"><div className="flex flex-wrap items-end justify-between gap-3"><div><h1 className="text-2xl font-semibold text-slate-900 dark:text-white">Inventory</h1><p className="mt-2 text-sm text-slate-600 dark:text-slate-400">Track live stock, batches, prices, and expiry alerts.</p></div><button onClick={() => showForm ? setShowForm(false) : openForm()} className="!m-0 !inline-flex !items-center !gap-2 !rounded-lg !bg-cyan-500 !px-4 !py-3 !text-sm !font-semibold !text-slate-950"><Plus size={17} /> Add Product / Stock</button></div></div>
     {showForm && <form onSubmit={addProduct} className="rounded-2xl border border-cyan-500/30 bg-white/90 p-5 dark:bg-slate-900/80"><h2 className="font-semibold text-slate-900 dark:text-white">Add product batch</h2><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      <div className="relative"><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Product name" className="w-full rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white" />{matchingNames.length > 0 && <div className="absolute z-10 mt-1 w-full rounded-lg border border-slate-200 bg-white p-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">{matchingNames.map((product) => <button type="button" key={product.id} onClick={() => setForm({ ...form, name: product.name, category: product.category || '', sku: product.sku || '', barcode: product.barcode || '' })} className="!m-0 !block !w-full !rounded-md !bg-transparent !p-2 !text-left !text-sm !text-slate-900 hover:!bg-slate-100 dark:!text-white dark:hover:!bg-slate-800">{product.name} <span className="text-slate-500">{product.sku || ''}</span></button>)}</div>}</div>
+      <div className="relative"><input required value={form.name} onChange={(event) => { setForm({ ...form, name: event.target.value }); setProductSuggestionsOpen(true) }} placeholder="Product name" className="w-full rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none placeholder:text-slate-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white" />{matchingNames.length > 0 && <div className="absolute z-10 mt-1 w-full rounded-lg border border-slate-200 bg-white p-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">{matchingNames.map((product) => <button type="button" key={product.id} onClick={() => { setForm({ ...form, name: product.name, category: product.category || '', sku: product.sku || '', barcode: product.barcode || '' }); setProductSuggestionsOpen(false) }} className="!m-0 !block !w-full !rounded-md !bg-transparent !p-2 !text-left !text-sm !text-slate-900 hover:!bg-slate-100 dark:!text-white dark:hover:!bg-slate-800">{product.name} <span className="text-slate-500">{product.sku || ''}</span></button>)}</div>}</div>
       <select required value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })} className="rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-white"><option value="" disabled>Select category</option>{form.category && !predefinedCategories.includes(form.category) && <option value={form.category}>{form.category}</option>}{predefinedCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select>
       <input value={form.sku} onChange={(event) => setForm({ ...form, sku: event.target.value })} placeholder="SKU" className="rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-white" />
       <input value={form.barcode} onChange={(event) => setForm({ ...form, barcode: event.target.value })} placeholder="Barcode" className="rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 dark:border-slate-700 dark:bg-slate-950 dark:text-white" />
@@ -209,7 +211,9 @@ export default function InventoryPage() {
     <div className="flex flex-wrap items-center gap-3"><div className="relative w-full min-w-0 max-w-md flex-1"><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search product, SKU, or barcode" className="w-full rounded-lg border border-slate-300 bg-white px-4 py-3 pr-12 text-sm text-slate-900 outline-none placeholder:text-slate-500 dark:border-slate-700 dark:bg-slate-950 dark:text-white" /><button type="button" onClick={() => setScannerOpen(true)} aria-label="Scan inventory barcode" className="!m-0 !absolute !right-1 !top-1/2 !-translate-y-1/2 !bg-transparent !p-2 !text-slate-500 dark:!text-slate-300"><Barcode size={18} /></button></div><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} aria-label="Filter by category" className="h-12 min-w-[190px] max-w-full rounded-lg border border-slate-300 bg-white px-4 text-sm text-slate-900 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20 dark:border-slate-700 dark:bg-slate-950 dark:text-white"><option value="">All Categories</option>{predefinedCategories.map((category) => <option key={category} value={category}>{category}</option>)}</select><select value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter by stock or expiry" className="h-12 min-w-[160px] max-w-full rounded-lg border border-slate-300 bg-white px-4 text-sm text-slate-900 outline-none transition focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20 dark:border-slate-700 dark:bg-slate-950 dark:text-white"><option value="">All</option><option value="low-stock">Low Stock</option><option value="expiring">Expiring Soon</option><option value="reorder">Reorder Alerts</option></select>{(categoryFilter || filter) && <button type="button" onClick={() => { setCategoryFilter(''); setFilter('') }} className="!m-0 !rounded-lg !border !border-slate-300 !bg-transparent !px-3 !py-2.5 !text-sm !font-medium !text-slate-700 transition hover:!bg-slate-100 dark:!border-slate-700 dark:!text-slate-300 dark:hover:!bg-slate-800">Clear filters</button>}</div>
     {filter === 'reorder' && <div className="rounded-2xl border border-slate-200 bg-white/80 p-6 dark:border-slate-800 dark:bg-slate-900/80"><h2 className="font-semibold text-slate-900 dark:text-white">Reorder suggestions</h2>{reorderProducts.length ? <div className="mt-4 grid gap-3 md:grid-cols-2">{reorderProducts.map((product) => <div key={product.id} className="rounded-xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-950"><p className="font-semibold text-slate-900 dark:text-white">{product.name}</p><p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{product.category || 'Uncategorized'}</p><div className="mt-3 grid gap-2 text-sm text-slate-600 dark:text-slate-300"><div className="flex justify-between"><span>Current stock</span><span>{product.current_stock} units</span></div><div className="flex justify-between"><span>Low-stock threshold</span><span>{product.low_stock_threshold} units</span></div><div className="flex justify-between"><span>Supplier</span><span>{product.supplier || 'N/A'}</span></div><div className="flex justify-between"><span>Purchase price</span><span>{product.purchase_price == null ? 'N/A' : money(product.purchase_price)}</span></div><div className="flex justify-between"><span>Next eligible expiry</span><span>{product.soonest_expiry ? `${product.soonest_expiry} · ${product.soonest_expiry_quantity} units` : 'No dated batch'}</span></div><div className="rounded-lg bg-cyan-500/10 p-2 text-sm font-medium text-cyan-700 dark:bg-cyan-950/40 dark:text-cyan-300">Suggested Order Quantity: {product.suggested_order_quantity} units</div><button type="button" onClick={() => openStockEntry(product, product.suggested_order_quantity)} className="!m-0 !rounded-lg !bg-cyan-500 !px-3 !py-2 !text-sm !font-medium !text-slate-950">Prepare stock entry</button><p className="text-xs text-slate-500 dark:text-slate-400">Review and save the batch details to confirm; stock is not changed until you submit.</p></div></div>)}</div> : <p className="mt-4 text-sm text-slate-500 dark:text-slate-400">No products need reorder right now.</p>}</div>}
     <div className="grid min-w-0 gap-4 md:grid-cols-2 2xl:grid-cols-3">
-      {filteredProducts.length ? filteredProducts.map((item) => (
+      {filteredProducts.length ? filteredProducts.map((item) => {
+        const activeBatchCount = item.batches.filter((batch) => batch.quantity_remaining > 0 && batch.status !== 'Expired').length
+        return (
         <article key={item.id} className="flex min-w-0 flex-col rounded-2xl border border-slate-200 bg-white/80 p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900/80">
           <div className="flex min-w-0 items-start justify-between gap-3">
             <div className="min-w-0">
@@ -220,10 +224,10 @@ export default function InventoryPage() {
           </div>
           <div className="mt-4 flex items-end justify-between gap-3 border-b border-slate-200 pb-4 dark:border-slate-800">
             <div><p className="text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-slate-400">Available stock</p><p className="mt-1 text-2xl font-semibold text-slate-900 dark:text-white">{item.stock} <span className="text-sm font-normal text-slate-500 dark:text-slate-400">units</span></p></div>
-            <span className="pb-1 text-xs text-slate-500 dark:text-slate-400">{item.batches.length} {item.batches.length === 1 ? 'batch' : 'batches'}</span>
+            <span className="pb-1 text-xs text-slate-500 dark:text-slate-400">{activeBatchCount} {activeBatchCount === 1 ? 'batch' : 'batches'}</span>
           </div>
           <div className="mt-4 min-w-0 flex-1 space-y-3">
-            {item.batches.map((batch) => (
+            {item.batches.filter((batch) => batch.quantity_remaining > 0).map((batch) => (
               <div key={batch.id} className={`min-w-0 rounded-xl border p-3 ${batch.status === 'Expired' ? 'border-rose-200 bg-rose-50/70 dark:border-rose-950 dark:bg-rose-950/20' : 'border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-950/60'}`}>
                 <div className="flex min-w-0 items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -247,7 +251,7 @@ export default function InventoryPage() {
           </div>
           <button type="button" onClick={() => remove(item.id)} className="!m-0 !mt-4 !inline-flex !w-fit !items-center !gap-2 !bg-transparent !p-0 !text-sm !text-rose-600 dark:!text-rose-400"><Trash2 size={15} /> Delete product</button>
         </article>
-      )) : <p className="text-sm text-slate-500 dark:text-slate-400">{filter ? `No ${filter === 'low-stock' ? 'low-stock' : 'expiring-soon'} products found.` : 'No products added yet.'}</p>}
+      )}) : <p className="text-sm text-slate-500 dark:text-slate-400">{filter ? `No ${filter === 'low-stock' ? 'low-stock' : 'expiring-soon'} products found.` : 'No products added yet.'}</p>}
     </div>
     <Dialog open={Boolean(discardTarget)} onOpenChange={(open) => { if (!open && !discarding) setDiscardTarget(null) }}>
       <DialogContent className="max-h-[90vh] overflow-y-auto border border-slate-200 bg-white text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-white sm:max-w-lg">
